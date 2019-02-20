@@ -23,6 +23,7 @@ type Consumer struct {
 
 	coreTopics  []string
 	extraTopics []string
+	topicPartitions map[string][]int32
 
 	dying, dead chan none
 
@@ -55,6 +56,7 @@ func NewConsumer(addrs []string, groupID string, topics []string, config *Config
 		groupID:  groupID,
 
 		coreTopics: topics,
+		topicPartitions: make(map[string][]int32),
 
 		dying: make(chan none),
 		dead:  make(chan none),
@@ -337,6 +339,14 @@ func (c *Consumer) nextTick() {
 	// Start topic watcher loop
 	tomb.Go(c.twLoop)
 
+	//cache topic partitions for watcher
+	c.topicPartitions = make(map[string][]int32)
+	for topic, _ := range subs {
+		partitions, err := c.client.Partitions(topic)
+		if err == nil {
+			c.topicPartitions[topic] = partitions
+		}
+	}
 	// Start consuming and committing offsets
 	tomb.Go(c.cmLoop)
 	atomic.StoreInt32(&c.consuming, 1)
@@ -387,6 +397,10 @@ func (c *Consumer) twLoop(stopped <-chan none) {
 			}
 
 			for _, topic := range topics {
+				// if topic is under subscription and partitions meta changed
+				if c.isPartitionChanged(topic) {
+					return
+				}
 				if !c.isKnownCoreTopic(topic) &&
 					!c.isKnownExtraTopic(topic) &&
 					c.isPotentialExtraTopic(topic) {
@@ -817,6 +831,27 @@ func (c *Consumer) isKnownCoreTopic(topic string) bool {
 func (c *Consumer) isKnownExtraTopic(topic string) bool {
 	pos := sort.SearchStrings(c.extraTopics, topic)
 	return pos < len(c.extraTopics) && c.extraTopics[pos] == topic
+}
+
+func (c *Consumer) isPartitionChanged(topic string) bool {
+	cachedPartitions, exist := c.topicPartitions[topic]
+	if !exist {
+		return false
+	}
+	partitions, err := c.client.Partitions(topic)
+	if err != nil {
+		c.handleError(&Error{Ctx: "partitions", error: err})
+		return false
+	}
+	if len(partitions) != len(cachedPartitions) {
+		return true
+	}
+	for i := 0; i < len(partitions); i++ {
+		if partitions[i] != cachedPartitions[i] {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Consumer) isPotentialExtraTopic(topic string) bool {
